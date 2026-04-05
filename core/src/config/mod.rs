@@ -16,7 +16,9 @@
 
 //! Compaction configuration types and constants.
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::time::Duration;
 
 use derive_builder::Builder;
 use parquet::basic::Compression;
@@ -45,11 +47,28 @@ pub const DEFAULT_MIN_SMALL_FILES_COUNT: usize = 5;
 pub const DEFAULT_MIN_FILES_WITH_DELETES_COUNT: usize = 1;
 pub const DEFAULT_MAX_AUTO_PLANS_PER_RUN: NonZeroUsize = NonZeroUsize::MAX;
 
+/// Manifest rewriting disabled by default (0 = disabled).
+pub const DEFAULT_MAX_MANIFEST_FILES_BEFORE_REWRITE: usize = 0;
+
 // Strategy configuration defaults
 pub const DEFAULT_TARGET_GROUP_SIZE: u64 = 100 * 1024 * 1024 * 1024; // 100GB - BinPack target size
 
 /// Overhead added to split size for bin-packing
 pub const SPLIT_OVERHEAD: u64 = 5 * 1024 * 1024;
+
+// Expire snapshots defaults
+/// Minimum snapshots to retain per branch during expiration.
+pub const DEFAULT_EXPIRE_SNAPSHOTS_RETAIN_LAST: i32 = 1;
+/// Maximum snapshot age in milliseconds before expiration (5 days).
+pub const DEFAULT_EXPIRE_SNAPSHOTS_MAX_AGE_MS: u64 = 5 * 24 * 60 * 60 * 1000;
+
+// Remove orphan files defaults
+/// Minimum file age in milliseconds before orphan deletion eligibility (7 days).
+pub const DEFAULT_REMOVE_ORPHAN_FILES_OLDER_THAN_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+/// Default concurrency for loading manifests during orphan file detection.
+pub const DEFAULT_REMOVE_ORPHAN_FILES_LOAD_CONCURRENCY: usize = 16;
+/// Default concurrency for deleting orphan files.
+pub const DEFAULT_REMOVE_ORPHAN_FILES_DELETE_CONCURRENCY: usize = 10;
 
 /// Configuration for bin-packing grouping strategy.
 ///
@@ -369,10 +388,12 @@ pub struct CompactionExecutionConfig {
     /// It remains temporarily for backward compatibility and will be removed in a
     /// future change.
     #[deprecated(
+        since = "0.2.0",
         note = "unused after switching to the upstream RollingFileWriter; this field is now a no-op and will be removed in a future change"
     )]
     #[builder(default = "DEFAULT_ENABLE_DYNAMIC_SIZE_ESTIMATION")]
     #[builder_setter_attr(deprecated(
+        since = "0.2.0",
         note = "unused after switching to the upstream RollingFileWriter; this setter is now a no-op and will be removed in a future change"
     ))]
     pub enable_dynamic_size_estimation: bool,
@@ -383,10 +404,12 @@ pub struct CompactionExecutionConfig {
     /// It remains temporarily for backward compatibility and will be removed in a
     /// future change.
     #[deprecated(
+        since = "0.2.0",
         note = "unused after switching to the upstream RollingFileWriter; this field is now a no-op and will be removed in a future change"
     )]
     #[builder(default = "DEFAULT_SIZE_ESTIMATION_SMOOTHING_FACTOR")]
     #[builder_setter_attr(deprecated(
+        since = "0.2.0",
         note = "unused after switching to the upstream RollingFileWriter; this setter is now a no-op and will be removed in a future change"
     ))]
     pub size_estimation_smoothing_factor: f64,
@@ -425,6 +448,137 @@ impl Default for CompactionExecutionConfig {
         CompactionExecutionConfigBuilder::default()
             .build()
             .expect("CompactionExecutionConfig default should always build")
+    }
+}
+
+/// Controls how manifest entries are grouped into new manifest files during rewriting.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ManifestClusteringStrategy {
+    /// Consolidate all data manifest entries into a single manifest file.
+    ///
+    /// This is the default and is useful for reducing manifest fragmentation
+    /// that accumulates after many small append commits.
+    #[default]
+    Single,
+    /// Group entries by their partition specification ID.
+    ///
+    /// Useful after partition spec evolution to align manifest entries with
+    /// the partition spec that produced them, which can improve scan pruning.
+    ByPartitionSpecId,
+}
+
+/// Configuration for manifest file rewriting.
+///
+/// This is a pure-metadata operation: no data files are read or written.
+/// It reorganises the manifest files that track data files to reduce
+/// fragmentation and improve scan planning performance.
+///
+/// All data manifests in the snapshot are always rewritten; only the
+/// clustering strategy and optional snapshot properties can be configured.
+///
+/// Only V1 and V2 format tables are supported; V3+ tables (which use row
+/// lineage) will return a `FeatureUnsupported` error.
+#[derive(Debug, Clone, Builder)]
+#[builder(setter(into))]
+pub struct RewriteManifestsConfig {
+    /// Strategy for clustering manifest entries into new manifest files.
+    #[builder(default)]
+    pub clustering_strategy: ManifestClusteringStrategy,
+
+    /// User-defined key/value properties attached to the rewrite snapshot.
+    ///
+    /// The iceberg library automatically appends internal rewrite metrics
+    /// (e.g. `manifests-created`) which take precedence if keys conflict.
+    #[builder(default)]
+    pub snapshot_properties: HashMap<String, String>,
+}
+
+impl Default for RewriteManifestsConfig {
+    fn default() -> Self {
+        RewriteManifestsConfigBuilder::default()
+            .build()
+            .expect("RewriteManifestsConfig default should always build")
+    }
+}
+
+/// Configuration for snapshot expiration.
+///
+/// Snapshots older than `max_snapshot_age` are expired unless retained by
+/// `retain_last` or referenced by an active branch. Specific snapshot IDs
+/// can also be expired regardless of age.
+#[derive(Debug, Clone, Builder)]
+#[builder(setter(into))]
+pub struct ExpireSnapshotsConfig {
+    /// Minimum number of snapshots to keep per branch.
+    ///
+    /// The most recent `retain_last` snapshots on each branch are always kept,
+    /// even if they are older than `max_snapshot_age`.
+    #[builder(default = "DEFAULT_EXPIRE_SNAPSHOTS_RETAIN_LAST")]
+    pub retain_last: i32,
+
+    /// Expire snapshots older than this duration.
+    ///
+    /// Defaults to 5 days, matching the iceberg-rust default.
+    #[builder(default = "Duration::from_millis(DEFAULT_EXPIRE_SNAPSHOTS_MAX_AGE_MS)")]
+    pub max_snapshot_age: Duration,
+
+    /// Specific snapshot IDs to expire regardless of age.
+    ///
+    /// These IDs are expired in addition to age-based expiration. The action
+    /// will error if any of these IDs are referenced by a retained branch.
+    #[builder(default)]
+    pub snapshot_ids_to_expire: Vec<i64>,
+
+    /// Remove unreachable partition specs and schemas from table metadata.
+    ///
+    /// When `true`, partition specs and schemas no longer referenced by any
+    /// retained snapshot are removed. Defaults to `false`.
+    #[builder(default = "false")]
+    pub clear_expired_metadata: bool,
+}
+
+impl Default for ExpireSnapshotsConfig {
+    fn default() -> Self {
+        ExpireSnapshotsConfigBuilder::default()
+            .build()
+            .expect("ExpireSnapshotsConfig default should always build")
+    }
+}
+
+/// Configuration for orphan file removal.
+///
+/// Files under the table location that are not referenced by any snapshot or
+/// table metadata and are older than `older_than` are considered orphans.
+/// Files without a last-modified timestamp are always skipped to protect
+/// in-progress writes.
+#[derive(Debug, Clone, Builder)]
+#[builder(setter(into))]
+pub struct RemoveOrphanFilesConfig {
+    /// Only files older than this duration are eligible for deletion.
+    ///
+    /// Defaults to 7 days to avoid deleting files written by in-progress
+    /// commits that have not yet been recorded in table metadata.
+    #[builder(default = "Duration::from_millis(DEFAULT_REMOVE_ORPHAN_FILES_OLDER_THAN_MS)")]
+    pub older_than: Duration,
+
+    /// When `true`, identifies orphan files without deleting them.
+    #[builder(default = "false")]
+    pub dry_run: bool,
+
+    /// Concurrency limit for loading manifest lists and manifests.
+    #[builder(default = "DEFAULT_REMOVE_ORPHAN_FILES_LOAD_CONCURRENCY")]
+    pub load_concurrency: usize,
+
+    /// Concurrency limit for file deletion operations.
+    #[builder(default = "DEFAULT_REMOVE_ORPHAN_FILES_DELETE_CONCURRENCY")]
+    pub delete_concurrency: usize,
+}
+
+impl Default for RemoveOrphanFilesConfig {
+    fn default() -> Self {
+        RemoveOrphanFilesConfigBuilder::default()
+            .build()
+            .expect("RemoveOrphanFilesConfig default should always build")
     }
 }
 
@@ -522,6 +676,21 @@ pub struct AutoCompactionConfig {
 
     #[builder(default)]
     pub execution: CompactionExecutionConfig,
+
+    /// Maximum number of data manifest files allowed in a snapshot before
+    /// manifest rewriting is triggered after data-file compaction.
+    ///
+    /// Manifest rewriting runs when the current snapshot contains more than
+    /// this many data-type manifest files. A value of `0` (the default)
+    /// disables automatic manifest rewriting entirely.
+    #[builder(default = "DEFAULT_MAX_MANIFEST_FILES_BEFORE_REWRITE")]
+    pub max_manifest_files_before_rewrite: usize,
+
+    /// Configuration for manifest rewriting, applied when
+    /// [`max_manifest_files_before_rewrite`](Self::max_manifest_files_before_rewrite)
+    /// is set and the threshold is exceeded.
+    #[builder(default)]
+    pub manifest_rewrite_config: RewriteManifestsConfig,
 }
 
 impl AutoCompactionConfig {
@@ -833,5 +1002,51 @@ mod tests {
 
         let stats = create_test_stats(10, 10, 0);
         assert!(config.small_files_candidate(&stats).is_none());
+    }
+
+    #[test]
+    fn test_auto_config_manifest_rewrite_disabled_by_default() {
+        let config = AutoCompactionConfig::default();
+        assert_eq!(
+            config.max_manifest_files_before_rewrite, 0,
+            "manifest rewriting should be disabled by default (0)"
+        );
+    }
+
+    #[test]
+    fn test_auto_config_manifest_rewrite_enabled_via_builder() {
+        let config = AutoCompactionConfigBuilder::default()
+            .max_manifest_files_before_rewrite(10_usize)
+            .build()
+            .unwrap();
+        assert_eq!(config.max_manifest_files_before_rewrite, 10);
+    }
+
+    #[test]
+    fn test_rewrite_manifests_config_defaults() {
+        let config = RewriteManifestsConfig::default();
+        assert_eq!(
+            config.clustering_strategy,
+            ManifestClusteringStrategy::Single
+        );
+        assert!(config.snapshot_properties.is_empty());
+    }
+
+    #[test]
+    fn test_rewrite_manifests_config_builder() {
+        let mut props = HashMap::new();
+        props.insert("reason".to_owned(), "test".to_owned());
+
+        let config = RewriteManifestsConfigBuilder::default()
+            .clustering_strategy(ManifestClusteringStrategy::ByPartitionSpecId)
+            .snapshot_properties(props.clone())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            config.clustering_strategy,
+            ManifestClusteringStrategy::ByPartitionSpecId
+        );
+        assert_eq!(config.snapshot_properties, props);
     }
 }

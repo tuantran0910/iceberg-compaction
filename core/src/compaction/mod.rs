@@ -14,6 +14,48 @@
  * limitations under the License.
  */
 
+//! Data file compaction for Iceberg tables.
+//!
+//! This module provides [`Compaction`] and [`AutoCompaction`] for merging small
+//! data files, applying pending delete files, and committing the results as a new
+//! Iceberg snapshot.
+//!
+//! # Compaction strategies
+//!
+//! Three planning strategies are available, configured via [`CompactionPlanningConfig`]:
+//!
+//! - **`SmallFiles`** — selects files below the target size threshold and groups
+//!   them with bin-packing. Use this for tables that accumulate many small
+//!   append files over time.
+//! - **`FilesWithDeletes`** — targets files that have accumulated positional or
+//!   equality delete files beyond a configurable threshold. Applying deletes
+//!   during compaction removes the overhead of merge-on-read at query time.
+//! - **`Full`** — rewrites all data files in every partition unconditionally.
+//!   Use sparingly; prefer `SmallFiles` or `FilesWithDeletes` for incremental
+//!   maintenance.
+//!
+//! [`AutoCompaction`] inspects snapshot statistics and selects between
+//! `SmallFiles` and `FilesWithDeletes` automatically.
+//!
+//! # Workflow
+//!
+//! The managed workflow handles planning, execution, and commit atomically:
+//!
+//! ```ignore
+//! let result = compaction.compact().await?;
+//! ```
+//!
+//! For distributed or streaming use cases the phases can be driven
+//! independently:
+//!
+//! ```ignore
+//! let plans = compaction.plan_compaction().await?;
+//! // Execute plans on separate workers, collect RewriteResult values...
+//! let table = compaction.commit_rewrite_results(results).await?;
+//! ```
+//!
+//! [`CompactionPlanningConfig`]: crate::config::CompactionPlanningConfig
+
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -240,6 +282,10 @@ pub struct CompactionResult {
     pub stats: RewriteFilesStat,
     /// Updated table metadata after commit (if available)
     pub table: Option<Table>,
+    /// Present when manifest rewriting was triggered and succeeded after
+    /// data-file compaction (e.g. via [`AutoCompaction`] with a
+    /// `max_manifest_files_before_rewrite` threshold configured).
+    pub manifest_rewrite: Option<crate::manifest_rewrite::RewriteManifestsResult>,
 }
 
 impl Compaction {
@@ -588,6 +634,7 @@ impl Compaction {
             data_files: merged_data_files,
             stats: merged_stats,
             table,
+            manifest_rewrite: None,
         }
     }
 
@@ -688,6 +735,7 @@ impl Compaction {
             data_files: rewrite_result.output_data_files,
             stats: rewrite_result.stats,
             table: Some(final_table),
+            manifest_rewrite: None,
         };
 
         Ok(Some(result))
@@ -725,15 +773,12 @@ async fn get_all_files_from_snapshot(
     file_io: &FileIO,
     table_metadata: &iceberg::spec::TableMetadata,
 ) -> Result<(Vec<DataFile>, Vec<DataFile>)> {
-    let manifest_list = snapshot
-        .load_manifest_list(file_io, table_metadata)
-        .await
-        .unwrap();
+    let manifest_list = snapshot.load_manifest_list(file_io, table_metadata).await?;
 
     let mut data_file = vec![];
     let mut delete_file = vec![];
     for manifest_file in manifest_list.entries() {
-        let a = manifest_file.load_manifest(file_io).await.unwrap();
+        let a = manifest_file.load_manifest(file_io).await?;
         let (entry, _) = a.into_parts();
         for i in entry {
             match i.content_type() {
@@ -1216,7 +1261,7 @@ fn custom_snapshot_properties(snapshot: &Snapshot) -> HashMap<String, String> {
 }
 
 /// Compaction plan describing files to rewrite and target commit location.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CompactionPlan {
     /// Group of files to be compacted together
     pub file_group: FileGroup,
@@ -2591,6 +2636,76 @@ mod tests {
         assert!(
             !custom.contains_key("partitions.date=2024-01-01"),
             "Partition keys must be filtered out"
+        );
+    }
+
+    /// Verifies that `get_all_files_from_snapshot` returns error when manifest list
+    /// points to a non-existent file.
+    #[tokio::test]
+    async fn test_get_all_files_from_snapshot_manifest_load_error() {
+        use std::collections::HashMap;
+
+        use iceberg::spec::Snapshot;
+        use tempfile::TempDir;
+
+        use super::get_all_files_from_snapshot;
+
+        let temp_dir = TempDir::new().unwrap();
+        let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
+
+        let catalog = Arc::new(
+            MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_owned(),
+                        warehouse_location.clone(),
+                    )]),
+                )
+                .await
+                .unwrap(),
+        );
+
+        let namespace_ident = NamespaceIdent::new("test_namespace".into());
+        let _ = catalog
+            .create_namespace(&namespace_ident, HashMap::new())
+            .await
+            .unwrap();
+
+        let table_ident = TableIdent::new(namespace_ident.clone(), "test_table".into());
+        let _ = catalog
+            .create_table(
+                &namespace_ident,
+                TableCreation::builder()
+                    .name(table_ident.name().into())
+                    .schema(simple_table_schema())
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let table = catalog.load_table(&table_ident).await.unwrap();
+
+        let snapshot = Snapshot::builder()
+            .with_snapshot_id(1)
+            .with_timestamp_ms(1000)
+            .with_sequence_number(1)
+            .with_schema_id(0)
+            .with_manifest_list("non-existent-manifest.avro")
+            .with_summary(iceberg::spec::Summary {
+                operation: iceberg::spec::Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+
+        let snapshot = Arc::new(snapshot);
+        let file_io = table.file_io();
+        let table_metadata = table.metadata();
+
+        let result = get_all_files_from_snapshot(&snapshot, file_io, table_metadata).await;
+        assert!(
+            result.is_err(),
+            "Expected error when manifest list points to non-existent file"
         );
     }
 }

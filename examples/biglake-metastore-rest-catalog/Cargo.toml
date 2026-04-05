@@ -1,0 +1,18 @@
+[package]
+name = "biglake-metastore-rest-catalog"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+datafusion = { workspace = true }
+futures = { workspace = true }
+iceberg = { workspace = true }
+iceberg-compaction-core = { workspace = true }
+parquet = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.0", features = ["v4"] }
+
+[lints]
+workspace = true
