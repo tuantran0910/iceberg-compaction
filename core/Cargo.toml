@@ -21,6 +21,7 @@ mixtrics = "0.2.0"
 parquet = { workspace = true }
 port_scanner = { workspace = true }
 rand = { workspace = true }
+serde = { version = "1.0", features = ["derive"] }
 sqlx = { version = "0.8.2", default-features = false, features = [
 	"bigdecimal",
 	"chrono",

@@ -40,7 +40,7 @@ use crate::{CompactionError, Result};
 /// - `total_size`: Sum of `data_files[*].length` (excludes delete file sizes)
 /// - `executor_parallelism`, `output_parallelism`: Set to 1 by default, calculated by
 ///   [`with_parallelism`](Self::with_parallelism) or [`with_calculated_parallelism`](Self::with_calculated_parallelism)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FileGroup {
     pub data_files: Vec<FileScanTask>,
     pub position_delete_files: Vec<FileScanTask>,

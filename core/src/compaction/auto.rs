@@ -32,9 +32,13 @@ use super::{
     CommitManagerRetryConfig, Compaction, CompactionBuilder, CompactionPlan, CompactionResult,
 };
 use crate::Result;
+use crate::common::metrics::CompactionMetricsRecorder;
 use crate::config::AutoCompactionConfig;
 use crate::executor::ExecutorType;
 use crate::file_selection::{FileSelector, PlanStrategy, SnapshotStats};
+use crate::manifest_rewrite::{
+    RewriteManifestsBuilder, RewriteManifestsResult, count_data_manifests,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoSelectedStrategy {
@@ -408,6 +412,11 @@ impl AutoCompactionBuilder {
 ///
 /// Selects between localized `FilesWithDeletes` and `SmallFiles` plans based on
 /// snapshot statistics and executes the compaction workflow.
+///
+/// When [`AutoCompactionConfig::max_manifest_files_before_rewrite`] is set,
+/// manifest rewriting is triggered automatically after data-file compaction
+/// whenever the number of data-type manifest files in the post-commit snapshot
+/// exceeds the configured threshold.
 pub struct AutoCompaction {
     inner: Compaction,
     auto_config: AutoCompactionConfig,
@@ -460,11 +469,77 @@ impl AutoCompaction {
         self.inner
             .record_overall_metrics(&rewrite_results, overall_start_time, commit_start_time);
 
-        let merged_result = self
+        let mut merged_result = self
             .inner
-            .merge_rewrite_results_to_compaction_result(rewrite_results, Some(final_table));
+            .merge_rewrite_results_to_compaction_result(rewrite_results, Some(final_table.clone()));
+
+        // Rewrite manifest files when the threshold is exceeded.
+        let (updated_table, manifest_rewrite) = self.maybe_rewrite_manifests(final_table).await?;
+        merged_result.table = Some(updated_table);
+        merged_result.manifest_rewrite = manifest_rewrite;
 
         Ok(Some(merged_result))
+    }
+
+    /// Triggers manifest rewriting when the data-manifest count in the current
+    /// snapshot exceeds the configured threshold.
+    ///
+    /// Returns the (possibly updated) table and an optional rewrite result.
+    /// When the threshold is not configured, or the count is within the limit,
+    /// returns `(table, None)` immediately without any I/O.
+    async fn maybe_rewrite_manifests(
+        &self,
+        table: Table,
+    ) -> Result<(Table, Option<RewriteManifestsResult>)> {
+        let max_manifests = self.auto_config.max_manifest_files_before_rewrite;
+        if max_manifests == 0 {
+            // 0 means disabled.
+            return Ok((table, None));
+        }
+
+        let manifest_count = count_data_manifests(&table, &self.inner.to_branch).await?;
+        if manifest_count <= max_manifests {
+            return Ok((table, None));
+        }
+
+        tracing::info!(
+            manifest_count,
+            threshold = max_manifests,
+            "Data manifest count exceeds threshold; triggering manifest rewriting"
+        );
+
+        let metrics_recorder = CompactionMetricsRecorder::new(
+            self.inner.metrics.clone(),
+            self.inner.catalog_name.clone(),
+            self.inner.table_ident_name.clone(),
+        );
+        metrics_recorder.record_manifest_rewrite_triggered();
+
+        let rewriter = RewriteManifestsBuilder::new(
+            self.inner.catalog.clone(),
+            self.inner.table_ident.clone(),
+            self.auto_config.manifest_rewrite_config.clone(),
+        )
+        .with_to_branch(self.inner.to_branch.clone())
+        .with_retry_config(self.inner.commit_retry_config.clone())
+        .build();
+
+        let rewrite_start = std::time::Instant::now();
+        match rewriter.rewrite().await? {
+            Some(result) => {
+                let duration_ms = rewrite_start.elapsed().as_millis() as f64;
+                metrics_recorder.record_manifest_rewrite_success(&result.stats);
+                metrics_recorder.record_manifest_rewrite_duration(duration_ms);
+                let updated_table = result.table.clone();
+                Ok((updated_table, Some(result)))
+            }
+            None => {
+                let duration_ms = rewrite_start.elapsed().as_millis() as f64;
+                metrics_recorder.record_manifest_rewrite_noop();
+                metrics_recorder.record_manifest_rewrite_duration(duration_ms);
+                Ok((table, None))
+            }
+        }
     }
 }
 
@@ -646,5 +721,159 @@ mod tests {
         assert!(selected.plans.is_empty());
         assert_eq!(selected.selected_strategy, None);
         assert_eq!(selected.reason, AutoPlanReason::NoPlansProduced);
+    }
+
+    // ── count_data_manifests tests ────────────────────────────────────────────
+
+    mod manifest_count_tests {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalog, MemoryCatalogBuilder};
+        use iceberg::spec::{DataFile, MAIN_BRANCH, NestedField, PrimitiveType, Schema, Type};
+        use iceberg::table::Table;
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+        use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+        use iceberg::writer::file_writer::ParquetWriterBuilder;
+        use iceberg::writer::file_writer::location_generator::{
+            DefaultFileNameGenerator, DefaultLocationGenerator,
+        };
+        use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+        use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+        use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
+        use parquet::file::properties::WriterProperties;
+        use tempfile::TempDir;
+        use uuid::Uuid;
+
+        use crate::manifest_rewrite::count_data_manifests;
+
+        struct TestEnv {
+            #[allow(dead_code)]
+            temp_dir: TempDir,
+            warehouse_location: String,
+            catalog: Arc<MemoryCatalog>,
+            table_ident: TableIdent,
+        }
+
+        async fn setup() -> TestEnv {
+            let temp_dir = TempDir::new().unwrap();
+            let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
+            let catalog = Arc::new(
+                MemoryCatalogBuilder::default()
+                    .load(
+                        "memory",
+                        HashMap::from([(
+                            MEMORY_CATALOG_WAREHOUSE.to_owned(),
+                            warehouse_location.clone(),
+                        )]),
+                    )
+                    .await
+                    .unwrap(),
+            );
+            let ns = NamespaceIdent::new("ns".into());
+            catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+
+            let table_ident = TableIdent::new(ns.clone(), "tbl".into());
+            let schema = Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
+                ])
+                .build()
+                .unwrap();
+            catalog
+                .create_table(
+                    &table_ident.namespace,
+                    TableCreation::builder()
+                        .name(table_ident.name().into())
+                        .schema(schema)
+                        .build(),
+                )
+                .await
+                .unwrap();
+
+            TestEnv {
+                temp_dir,
+                warehouse_location,
+                catalog,
+                table_ident,
+            }
+        }
+
+        async fn write_and_append(
+            table: &Table,
+            catalog: &Arc<MemoryCatalog>,
+            warehouse_location: &str,
+        ) -> Table {
+            let schema = table.metadata().current_schema().clone();
+            let loc = DefaultLocationGenerator::with_data_location(warehouse_location.to_owned());
+            let fname = DefaultFileNameGenerator::new(
+                "data".to_owned(),
+                Some(Uuid::now_v7().to_string()),
+                iceberg::spec::DataFileFormat::Parquet,
+            );
+            let rolling = RollingFileWriterBuilder::new(
+                ParquetWriterBuilder::new(WriterProperties::builder().build(), schema),
+                1024 * 1024,
+                table.file_io().clone(),
+                loc,
+                fname,
+            );
+            let mut writer = DataFileWriterBuilder::new(rolling)
+                .build(None)
+                .await
+                .unwrap();
+
+            use datafusion::arrow::array::Int32Array;
+            use datafusion::arrow::record_batch::RecordBatch;
+            use iceberg::arrow::schema_to_arrow_schema;
+            let arrow_schema =
+                Arc::new(schema_to_arrow_schema(table.metadata().current_schema()).unwrap());
+            let batch =
+                RecordBatch::try_new(arrow_schema, vec![Arc::new(Int32Array::from(vec![1]))])
+                    .unwrap();
+            writer.write(batch).await.unwrap();
+            let data_files: Vec<DataFile> = writer.close().await.unwrap();
+
+            let txn = Transaction::new(table);
+            let action = txn.fast_append().add_data_files(data_files);
+            let txn = action.apply(txn).unwrap();
+            txn.commit(catalog.as_ref()).await.unwrap()
+        }
+
+        #[tokio::test]
+        async fn test_count_data_manifests_no_snapshot() {
+            let env = setup().await;
+            let table = env.catalog.load_table(&env.table_ident).await.unwrap();
+            let count = count_data_manifests(&table, MAIN_BRANCH).await.unwrap();
+            assert_eq!(count, 0, "empty table has no manifests");
+        }
+
+        #[tokio::test]
+        async fn test_count_data_manifests_correct_count() {
+            let env = setup().await;
+            let table = env.catalog.load_table(&env.table_ident).await.unwrap();
+
+            // Three separate appends → three manifests.
+            let table = write_and_append(&table, &env.catalog, &env.warehouse_location).await;
+            let table = write_and_append(&table, &env.catalog, &env.warehouse_location).await;
+            let table = write_and_append(&table, &env.catalog, &env.warehouse_location).await;
+
+            let count = count_data_manifests(&table, MAIN_BRANCH).await.unwrap();
+            assert_eq!(count, 3);
+        }
+
+        #[tokio::test]
+        async fn test_count_data_manifests_unknown_branch_returns_zero() {
+            let env = setup().await;
+            let table = env.catalog.load_table(&env.table_ident).await.unwrap();
+            let _ = write_and_append(&table, &env.catalog, &env.warehouse_location).await;
+
+            // Reload to get latest state.
+            let table = env.catalog.load_table(&env.table_ident).await.unwrap();
+            let count = count_data_manifests(&table, "nonexistent-branch")
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "unknown branch has no snapshot");
+        }
     }
 }

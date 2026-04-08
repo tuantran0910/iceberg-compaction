@@ -20,6 +20,9 @@ use std::sync::Arc;
 use mixtrics::metrics::{BoxedCounterVec, BoxedHistogramVec, BoxedRegistry, Buckets};
 
 use crate::executor::RewriteFilesStat;
+use crate::expire_snapshots::ExpireSnapshotsStats;
+use crate::manifest_rewrite::RewriteManifestsStats;
+use crate::remove_orphan_files::RemoveOrphanFilesStats;
 
 pub struct Metrics {
     // commit metrics
@@ -49,6 +52,32 @@ pub struct Metrics {
     // DataFusion distribution metrics
     pub compaction_datafusion_batch_row_count_dist: BoxedHistogramVec,
     pub compaction_datafusion_batch_bytes_dist: BoxedHistogramVec,
+
+    // Manifest rewrite metrics
+    pub compaction_manifest_rewrite_triggered_counter: BoxedCounterVec,
+    pub compaction_manifest_rewrite_success_counter: BoxedCounterVec,
+    pub compaction_manifest_rewrite_noop_counter: BoxedCounterVec,
+    pub compaction_manifest_rewrite_failed_counter: BoxedCounterVec,
+    pub compaction_manifest_rewrite_duration: BoxedHistogramVec,
+    pub compaction_manifest_rewrite_created_total: BoxedCounterVec,
+    pub compaction_manifest_rewrite_replaced_total: BoxedCounterVec,
+    pub compaction_manifest_rewrite_entries_processed_total: BoxedCounterVec,
+
+    // Expire snapshots metrics
+    pub expire_snapshots_triggered_counter: BoxedCounterVec,
+    pub expire_snapshots_success_counter: BoxedCounterVec,
+    pub expire_snapshots_noop_counter: BoxedCounterVec,
+    pub expire_snapshots_failed_counter: BoxedCounterVec,
+    pub expire_snapshots_duration: BoxedHistogramVec,
+    pub expire_snapshots_expired_snapshots_total: BoxedCounterVec,
+
+    // Remove orphan files metrics
+    pub remove_orphan_files_triggered_counter: BoxedCounterVec,
+    pub remove_orphan_files_success_counter: BoxedCounterVec,
+    pub remove_orphan_files_failed_counter: BoxedCounterVec,
+    pub remove_orphan_files_duration: BoxedHistogramVec,
+    pub remove_orphan_files_found_total: BoxedCounterVec,
+    pub remove_orphan_files_deleted_total: BoxedCounterVec,
 }
 
 impl Metrics {
@@ -218,6 +247,132 @@ impl Metrics {
             Buckets::exponential(1024.0 * 64.0, 2.0, 12), // 64KB, 128KB, 256KB, ..., 128MB
         );
 
+        // === Manifest rewrite metrics ===
+        let compaction_manifest_rewrite_triggered_counter = registry.register_counter_vec(
+            "iceberg_compaction_manifest_rewrite_triggered_total".into(),
+            "Number of times manifest rewrite was triggered (threshold exceeded)".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let compaction_manifest_rewrite_success_counter = registry.register_counter_vec(
+            "iceberg_compaction_manifest_rewrite_success_total".into(),
+            "Number of times manifest rewrite produced a new snapshot".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let compaction_manifest_rewrite_noop_counter = registry.register_counter_vec(
+            "iceberg_compaction_manifest_rewrite_noop_total".into(),
+            "Number of times manifest rewrite was a no-op (≤1 manifest)".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let compaction_manifest_rewrite_failed_counter = registry.register_counter_vec(
+            "iceberg_compaction_manifest_rewrite_failed_total".into(),
+            "Number of times manifest rewrite failed".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let compaction_manifest_rewrite_duration = registry.register_histogram_vec_with_buckets(
+            "iceberg_compaction_manifest_rewrite_duration_ms".into(),
+            "Duration of manifest rewrite operations in milliseconds".into(),
+            &["catalog_name", "table_ident"],
+            Buckets::exponential(1000.0, 4.0, 8), // 1s to ~4.5h
+        );
+
+        let compaction_manifest_rewrite_created_total = registry.register_counter_vec(
+            "iceberg_compaction_manifest_rewrite_created_total".into(),
+            "New manifest files written during manifest rewriting".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let compaction_manifest_rewrite_replaced_total = registry.register_counter_vec(
+            "iceberg_compaction_manifest_rewrite_replaced_total".into(),
+            "Old manifest files replaced during manifest rewriting".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let compaction_manifest_rewrite_entries_processed_total = registry.register_counter_vec(
+            "iceberg_compaction_manifest_rewrite_entries_processed_total".into(),
+            "Data-file entries processed during manifest rewriting".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        // === Expire snapshots metrics ===
+        let expire_snapshots_triggered_counter = registry.register_counter_vec(
+            "iceberg_expire_snapshots_triggered_total".into(),
+            "Number of times expire snapshots was invoked".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let expire_snapshots_success_counter = registry.register_counter_vec(
+            "iceberg_expire_snapshots_success_total".into(),
+            "Number of times expire snapshots produced a metadata commit".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let expire_snapshots_noop_counter = registry.register_counter_vec(
+            "iceberg_expire_snapshots_noop_total".into(),
+            "Number of times expire snapshots was a no-op (nothing to expire)".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let expire_snapshots_failed_counter = registry.register_counter_vec(
+            "iceberg_expire_snapshots_failed_total".into(),
+            "Number of times expire snapshots failed".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let expire_snapshots_duration = registry.register_histogram_vec_with_buckets(
+            "iceberg_expire_snapshots_duration_ms".into(),
+            "Duration of expire snapshots operations in milliseconds".into(),
+            &["catalog_name", "table_ident"],
+            Buckets::exponential(1000.0, 4.0, 8), // 1s to ~4.5h
+        );
+
+        let expire_snapshots_expired_snapshots_total = registry.register_counter_vec(
+            "iceberg_expire_snapshots_expired_snapshots_total".into(),
+            "Total number of snapshots expired across all operations".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        // === Remove orphan files metrics ===
+        let remove_orphan_files_triggered_counter = registry.register_counter_vec(
+            "iceberg_remove_orphan_files_triggered_total".into(),
+            "Number of times remove orphan files was invoked".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let remove_orphan_files_success_counter = registry.register_counter_vec(
+            "iceberg_remove_orphan_files_success_total".into(),
+            "Number of times remove orphan files completed successfully".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let remove_orphan_files_failed_counter = registry.register_counter_vec(
+            "iceberg_remove_orphan_files_failed_total".into(),
+            "Number of times remove orphan files failed".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let remove_orphan_files_duration = registry.register_histogram_vec_with_buckets(
+            "iceberg_remove_orphan_files_duration_ms".into(),
+            "Duration of remove orphan files operations in milliseconds".into(),
+            &["catalog_name", "table_ident"],
+            Buckets::exponential(1000.0, 4.0, 8), // 1s to ~4.5h
+        );
+
+        let remove_orphan_files_found_total = registry.register_counter_vec(
+            "iceberg_remove_orphan_files_found_total".into(),
+            "Total number of orphan files identified across all operations".into(),
+            &["catalog_name", "table_ident"],
+        );
+
+        let remove_orphan_files_deleted_total = registry.register_counter_vec(
+            "iceberg_remove_orphan_files_deleted_total".into(),
+            "Total number of orphan files deleted across all operations".into(),
+            &["catalog_name", "table_ident"],
+        );
+
         Self {
             compaction_commit_counter,
             compaction_duration,
@@ -242,6 +397,32 @@ impl Metrics {
             compaction_datafusion_bytes_processed_total,
             compaction_datafusion_batch_row_count_dist,
             compaction_datafusion_batch_bytes_dist,
+
+            // manifest rewrite metrics
+            compaction_manifest_rewrite_triggered_counter,
+            compaction_manifest_rewrite_success_counter,
+            compaction_manifest_rewrite_noop_counter,
+            compaction_manifest_rewrite_failed_counter,
+            compaction_manifest_rewrite_duration,
+            compaction_manifest_rewrite_created_total,
+            compaction_manifest_rewrite_replaced_total,
+            compaction_manifest_rewrite_entries_processed_total,
+
+            // expire snapshots metrics
+            expire_snapshots_triggered_counter,
+            expire_snapshots_success_counter,
+            expire_snapshots_noop_counter,
+            expire_snapshots_failed_counter,
+            expire_snapshots_duration,
+            expire_snapshots_expired_snapshots_total,
+
+            // remove orphan files metrics
+            remove_orphan_files_triggered_counter,
+            remove_orphan_files_success_counter,
+            remove_orphan_files_failed_counter,
+            remove_orphan_files_duration,
+            remove_orphan_files_found_total,
+            remove_orphan_files_deleted_total,
         }
     }
 }
@@ -465,5 +646,174 @@ impl CompactionMetricsRecorder {
                 .histogram(&label_vec)
                 .record(batch_bytes as f64);
         }
+    }
+
+    /// Record manifest rewrite triggered (threshold check passed)
+    pub fn record_manifest_rewrite_triggered(&self) {
+        let label_vec = self.label_vec();
+        self.metrics
+            .compaction_manifest_rewrite_triggered_counter
+            .counter(&label_vec)
+            .increase(1);
+    }
+
+    /// Record manifest rewrite success (produced a new snapshot)
+    pub fn record_manifest_rewrite_success(&self, stats: &RewriteManifestsStats) {
+        let label_vec = self.label_vec();
+        self.metrics
+            .compaction_manifest_rewrite_success_counter
+            .counter(&label_vec)
+            .increase(1);
+        if stats.created_manifests_count > 0 {
+            self.metrics
+                .compaction_manifest_rewrite_created_total
+                .counter(&label_vec)
+                .increase(stats.created_manifests_count);
+        }
+        if stats.replaced_manifests_count > 0 {
+            self.metrics
+                .compaction_manifest_rewrite_replaced_total
+                .counter(&label_vec)
+                .increase(stats.replaced_manifests_count);
+        }
+        if stats.processed_entry_count > 0 {
+            self.metrics
+                .compaction_manifest_rewrite_entries_processed_total
+                .counter(&label_vec)
+                .increase(stats.processed_entry_count);
+        }
+    }
+
+    /// Record manifest rewrite was a no-op
+    pub fn record_manifest_rewrite_noop(&self) {
+        let label_vec = self.label_vec();
+        self.metrics
+            .compaction_manifest_rewrite_noop_counter
+            .counter(&label_vec)
+            .increase(1);
+    }
+
+    /// Record manifest rewrite failure
+    pub fn record_manifest_rewrite_failed(&self) {
+        let label_vec = self.label_vec();
+        self.metrics
+            .compaction_manifest_rewrite_failed_counter
+            .counter(&label_vec)
+            .increase(1);
+    }
+
+    /// Record manifest rewrite duration
+    pub fn record_manifest_rewrite_duration(&self, duration_ms: f64) {
+        if duration_ms == 0.0 || !duration_ms.is_finite() {
+            return;
+        }
+        let label_vec = self.label_vec();
+        self.metrics
+            .compaction_manifest_rewrite_duration
+            .histogram(&label_vec)
+            .record(duration_ms);
+    }
+
+    /// Record that expire snapshots was triggered.
+    pub fn record_expire_snapshots_triggered(&self) {
+        let label_vec = self.label_vec();
+        self.metrics
+            .expire_snapshots_triggered_counter
+            .counter(&label_vec)
+            .increase(1);
+    }
+
+    /// Record a successful expire snapshots operation that produced a commit.
+    pub fn record_expire_snapshots_success(&self, stats: &ExpireSnapshotsStats, duration_ms: f64) {
+        let label_vec = self.label_vec();
+        self.metrics
+            .expire_snapshots_success_counter
+            .counter(&label_vec)
+            .increase(1);
+        if stats.expired_snapshot_count > 0 {
+            self.metrics
+                .expire_snapshots_expired_snapshots_total
+                .counter(&label_vec)
+                .increase(stats.expired_snapshot_count);
+        }
+        if duration_ms > 0.0 && duration_ms.is_finite() {
+            self.metrics
+                .expire_snapshots_duration
+                .histogram(&label_vec)
+                .record(duration_ms);
+        }
+    }
+
+    /// Record an expire snapshots no-op (nothing was expired).
+    pub fn record_expire_snapshots_noop(&self, duration_ms: f64) {
+        let label_vec = self.label_vec();
+        self.metrics
+            .expire_snapshots_noop_counter
+            .counter(&label_vec)
+            .increase(1);
+        if duration_ms > 0.0 && duration_ms.is_finite() {
+            self.metrics
+                .expire_snapshots_duration
+                .histogram(&label_vec)
+                .record(duration_ms);
+        }
+    }
+
+    /// Record an expire snapshots failure.
+    pub fn record_expire_snapshots_failed(&self) {
+        let label_vec = self.label_vec();
+        self.metrics
+            .expire_snapshots_failed_counter
+            .counter(&label_vec)
+            .increase(1);
+    }
+
+    /// Record that remove orphan files was triggered.
+    pub fn record_remove_orphan_files_triggered(&self) {
+        let label_vec = self.label_vec();
+        self.metrics
+            .remove_orphan_files_triggered_counter
+            .counter(&label_vec)
+            .increase(1);
+    }
+
+    /// Record a successful remove orphan files operation.
+    pub fn record_remove_orphan_files_success(
+        &self,
+        stats: &RemoveOrphanFilesStats,
+        duration_ms: f64,
+    ) {
+        let label_vec = self.label_vec();
+        self.metrics
+            .remove_orphan_files_success_counter
+            .counter(&label_vec)
+            .increase(1);
+        if stats.orphan_files_found > 0 {
+            self.metrics
+                .remove_orphan_files_found_total
+                .counter(&label_vec)
+                .increase(stats.orphan_files_found);
+        }
+        if stats.orphan_files_deleted > 0 {
+            self.metrics
+                .remove_orphan_files_deleted_total
+                .counter(&label_vec)
+                .increase(stats.orphan_files_deleted);
+        }
+        if duration_ms > 0.0 && duration_ms.is_finite() {
+            self.metrics
+                .remove_orphan_files_duration
+                .histogram(&label_vec)
+                .record(duration_ms);
+        }
+    }
+
+    /// Record a remove orphan files failure.
+    pub fn record_remove_orphan_files_failed(&self) {
+        let label_vec = self.label_vec();
+        self.metrics
+            .remove_orphan_files_failed_counter
+            .counter(&label_vec)
+            .increase(1);
     }
 }
