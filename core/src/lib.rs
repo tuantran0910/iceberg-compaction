@@ -14,6 +14,12 @@
  * limitations under the License.
  */
 
+//! Iceberg table compaction.
+//!
+//! Compaction runs can be scoped with a predicate or a set of partition values
+//! (`CompactionPlanner`/`CompactionBuilder::with_predicate` and `with_partition_filter`).
+//! Partition scoping matches partitions by value and assumes a stable partition spec.
+
 pub mod common;
 pub mod compaction;
 pub mod config;
@@ -25,7 +31,7 @@ pub use compaction::{AutoCompaction, AutoCompactionBuilder};
 pub use config::{AutoCompactionConfig, AutoThresholds, CompactionConfig};
 pub use error::{CompactionError, Result};
 pub use executor::CompactionExecutor;
-pub use file_selection::SnapshotStats;
+pub use file_selection::{PartitionFilterStrategy, SnapshotStats};
 // Re-export iceberg related crates
 pub use iceberg;
 // pub use iceberg_catalog_memory;

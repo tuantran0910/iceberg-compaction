@@ -24,7 +24,7 @@
 //!
 //! Parallelism is calculated per group based on file size and count constraints.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use iceberg::scan::FileScanTask;
 
@@ -582,6 +582,51 @@ impl std::fmt::Display for DeleteFileCountFilterStrategy {
     }
 }
 
+/// File filter that keeps only files whose partition is in a target set.
+///
+/// Applied before grouping, so it composes with both [`FileGroupScope::Partition`]
+/// and [`FileGroupScope::Table`]: grouping simply sees fewer files. Matching is by
+/// partition `Struct` value and assumes a stable partition spec; an empty target
+/// set keeps no files.
+#[derive(Debug)]
+pub struct PartitionFilterStrategy {
+    targets: HashSet<PartitionKey>,
+}
+
+impl PartitionFilterStrategy {
+    /// Builds a filter from the target partition values.
+    pub fn from_structs(partitions: impl IntoIterator<Item = iceberg::spec::Struct>) -> Self {
+        Self {
+            targets: partitions.into_iter().map(PartitionKey).collect(),
+        }
+    }
+
+    /// Number of distinct target partitions.
+    pub fn len(&self) -> usize {
+        self.targets.len()
+    }
+
+    /// Returns `true` when there are no target partitions (filters out everything).
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+}
+
+impl FileFilterStrategy for PartitionFilterStrategy {
+    fn filter(&self, data_files: Vec<FileScanTask>) -> Vec<FileScanTask> {
+        data_files
+            .into_iter()
+            .filter(|task| self.targets.contains(&PartitionKey::from_task(task)))
+            .collect()
+    }
+}
+
+impl std::fmt::Display for PartitionFilterStrategy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PartitionFilter[{} partitions]", self.targets.len())
+    }
+}
+
 /// Group filter by minimum total size.
 ///
 /// Filters by `group.total_size >= min_group_size`.
@@ -711,6 +756,12 @@ impl PlanStrategy {
             file_group_scope: options.file_group_scope,
             group_filters: options.group_filters,
         }
+    }
+
+    /// Inserts a file filter at the front of the filter list, so it runs before
+    /// the other file filters and before grouping.
+    pub fn prepend_file_filter(&mut self, filter: Box<dyn FileFilterStrategy>) {
+        self.file_filters.insert(0, filter);
     }
 
     /// Executes the pipeline:
@@ -940,8 +991,20 @@ impl std::fmt::Display for PlanStrategy {
     }
 }
 
-#[derive(Eq, Hash, PartialEq)]
+#[derive(Debug, Eq, Hash, PartialEq)]
 struct PartitionKey(iceberg::spec::Struct);
+
+impl PartitionKey {
+    /// Derives the partition key for a scan task, mapping an absent partition to
+    /// the empty `Struct`. Shared by grouping and partition filtering so both use
+    /// identical keys.
+    fn from_task(task: &FileScanTask) -> Self {
+        match &task.partition {
+            Some(partition) => PartitionKey(partition.clone()),
+            None => PartitionKey(iceberg::spec::Struct::empty()),
+        }
+    }
+}
 
 /// Groups files by their partition key, which is based on the values of their
 /// partition fields.
@@ -954,13 +1017,10 @@ fn group_files_by_partition<I>(files: I) -> HashMap<PartitionKey, Vec<FileScanTa
 where I: Iterator<Item = FileScanTask> {
     let mut partitioned_groups: HashMap<PartitionKey, Vec<FileScanTask>> = HashMap::new();
     for file in files {
-        let partition_key = match &file.partition {
-            Some(partition) => PartitionKey(partition.clone()),
-            // All FileScanTask files will have a partition value, even if it's empty. None doesn't
-            // seem to be a valid value (although that could change). For now, set it to the default
-            // value for an unpartitioned file, which is an empty Struct.
-            None => PartitionKey(iceberg::spec::Struct::empty()),
-        };
+        // All FileScanTask files will have a partition value, even if it's empty. None doesn't
+        // seem to be a valid value (although that could change). For now, set it to the default
+        // value for an unpartitioned file, which is an empty Struct.
+        let partition_key = PartitionKey::from_task(&file);
         partitioned_groups
             .entry(partition_key)
             .or_default()
@@ -2825,6 +2885,41 @@ mod tests {
             .with_partition(create_partition_value(partition_num))
             .with_schema(get_test_schema_with_partition())
             .build()
+    }
+
+    #[test]
+    fn test_partition_filter_keeps_only_target_partitions() {
+        let files = vec![
+            partitioned_file("p0_a.parquet", 0),
+            partitioned_file("p0_b.parquet", 0),
+            partitioned_file("p1_a.parquet", 1),
+            partitioned_file("p2_a.parquet", 2),
+        ];
+
+        let filter = PartitionFilterStrategy::from_structs(vec![
+            create_partition_value(0),
+            create_partition_value(2),
+        ]);
+        let kept = filter.filter(files);
+
+        assert_eq!(kept.len(), 3);
+        assert!(
+            kept.iter()
+                .all(|task| task.data_file_path != "p1_a.parquet")
+        );
+    }
+
+    #[test]
+    fn test_partition_filter_empty_target_drops_all() {
+        let files = vec![
+            partitioned_file("p0.parquet", 0),
+            partitioned_file("p1.parquet", 1),
+        ];
+
+        let filter = PartitionFilterStrategy::from_structs(Vec::<iceberg::spec::Struct>::new());
+
+        assert!(filter.is_empty());
+        assert!(filter.filter(files).is_empty());
     }
 
     fn min_file_count_filter(min_file_count: usize) -> crate::config::GroupFilters {

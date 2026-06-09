@@ -15,6 +15,7 @@
  */
 
 use futures::stream::TryStreamExt;
+use iceberg::expr::Predicate;
 use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
 
@@ -30,7 +31,7 @@ pub struct SnapshotStats {
     pub delete_heavy_files_count: usize,
 }
 pub use packer::ListPacker;
-pub use strategy::{FileGroup, PlanStrategy, PlanStrategyOptions};
+pub use strategy::{FileGroup, PartitionFilterStrategy, PlanStrategy, PlanStrategyOptions};
 
 /// File selection service responsible for selecting files for various operations
 pub struct FileSelector;
@@ -43,17 +44,27 @@ impl FileSelector {
         snapshot_id: i64,
         strategy: PlanStrategy,
         config: &crate::config::CompactionPlanningConfig,
+        predicate: Option<&Predicate>,
     ) -> Result<Vec<FileGroup>> {
-        let data_files = Self::scan_data_files(table, snapshot_id).await?;
+        let data_files = Self::scan_data_files(table, snapshot_id, predicate).await?;
         strategy.execute(data_files, config)
     }
 
     /// Scans and collects all data files from a table snapshot.
     ///
     /// Filters out non-data files (delete files). Returns raw `FileScanTask`s
-    /// for downstream processing.
-    pub async fn scan_data_files(table: &Table, snapshot_id: i64) -> Result<Vec<FileScanTask>> {
-        let scan = table.scan().snapshot_id(snapshot_id).build()?;
+    /// for downstream processing. When `predicate` is `Some`, it is pushed into
+    /// the scan so files are pruned during planning.
+    pub async fn scan_data_files(
+        table: &Table,
+        snapshot_id: i64,
+        predicate: Option<&Predicate>,
+    ) -> Result<Vec<FileScanTask>> {
+        let mut scan_builder = table.scan().snapshot_id(snapshot_id);
+        if let Some(predicate) = predicate {
+            scan_builder = scan_builder.with_filter(predicate.clone());
+        }
+        let scan = scan_builder.build()?;
 
         let file_scan_stream = scan.plan_files().await?;
 

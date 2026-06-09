@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use backon::{ExponentialBuilder, Retryable};
 use iceberg::io::FileIO;
-use iceberg::spec::{DataFile, MAIN_BRANCH, Snapshot, UNASSIGNED_SNAPSHOT_ID};
+use iceberg::expr::Predicate;
+use iceberg::spec::{DataFile, MAIN_BRANCH, Snapshot, Struct, UNASSIGNED_SNAPSHOT_ID};
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::file_writer::location_generator::DefaultLocationGenerator;
@@ -88,13 +89,15 @@ fn validate_rewrite_results_consistency(
 pub struct CompactionBuilder {
     catalog: Arc<dyn Catalog>,
     table_ident: TableIdent,
-
     catalog_name: Option<Cow<'static, str>>,
     config: Option<Arc<CompactionConfig>>,
     executor_type: Option<ExecutorType>,
     registry: Option<BoxedRegistry>,
     commit_retry_config: Option<CommitManagerRetryConfig>,
     to_branch: Option<Cow<'static, str>>,
+    predicate: Option<Predicate>,
+    partition_filter: Option<Vec<Struct>>,
+    snapshot_properties: Option<HashMap<String, String>>,
 }
 
 impl CompactionBuilder {
@@ -110,6 +113,9 @@ impl CompactionBuilder {
             registry: None,
             commit_retry_config: None,
             to_branch: None,
+            predicate: None,
+            partition_filter: None,
+            snapshot_properties: None,
         }
     }
 
@@ -149,6 +155,30 @@ impl CompactionBuilder {
         self
     }
 
+    /// Scopes the managed workflow to files matching `predicate`.
+    pub fn with_predicate(mut self, predicate: Predicate) -> Self {
+        self.predicate = Some(predicate);
+        self
+    }
+
+    /// Scopes the managed workflow to the given set of partition values. An empty
+    /// set selects no files. Matching assumes a stable partition spec.
+    pub fn with_partition_filter(mut self, partitions: Vec<Struct>) -> Self {
+        self.partition_filter = Some(partitions);
+        self
+    }
+
+    /// Sets additional snapshot summary properties to inject into the compaction
+    /// snapshot.  These are merged with any custom properties already present on
+    /// the base snapshot.
+    pub fn with_snapshot_properties(
+        mut self,
+        props: HashMap<String, String>,
+    ) -> Self {
+        self.snapshot_properties = Some(props);
+        self
+    }
+
     /// Builds the `Compaction` instance with configured values.
     pub fn build(self) -> Compaction {
         let executor_type = self.executor_type.unwrap_or(ExecutorType::DataFusion);
@@ -182,6 +212,9 @@ impl CompactionBuilder {
             catalog_name,
             commit_retry_config,
             to_branch,
+            predicate: self.predicate,
+            partition_filter: self.partition_filter,
+            snapshot_properties: self.snapshot_properties,
         }
     }
 }
@@ -212,6 +245,12 @@ pub struct Compaction {
 
     pub commit_retry_config: CommitManagerRetryConfig,
     pub to_branch: Cow<'static, str>,
+    /// Optional predicate for scoped managed compaction.
+    pub predicate: Option<Predicate>,
+    /// Optional partition-value set for scoped managed compaction.
+    pub partition_filter: Option<Vec<Struct>>,
+    /// Optional snapshot summary properties to inject into compaction snapshots.
+    pub snapshot_properties: Option<HashMap<String, String>>,
 }
 
 /// Intermediate result from `rewrite_plan()` before commit.
@@ -448,7 +487,14 @@ impl Compaction {
     pub async fn plan_compaction(&self) -> Result<Vec<CompactionPlan>> {
         if let Some(config) = &self.config {
             let table = self.catalog.load_table(&self.table_ident).await?;
-            let compaction_planner = CompactionPlanner::new(config.planning.clone());
+            let mut compaction_planner = CompactionPlanner::new(config.planning.clone());
+            if let Some(predicate) = &self.predicate {
+                compaction_planner = compaction_planner.with_predicate(predicate.clone());
+            }
+            if let Some(partitions) = &self.partition_filter {
+                compaction_planner =
+                    compaction_planner.with_partition_filter(partitions.clone());
+            }
 
             compaction_planner
                 .plan_compaction_with_branch(&table, &self.to_branch)
@@ -501,6 +547,7 @@ impl Compaction {
                 self.catalog_name.clone(),
                 self.metrics.clone(),
                 consistency_params,
+                self.snapshot_properties.clone().unwrap_or_default(),
             );
 
             // Delegate to CommitManager's high-level interface
@@ -722,6 +769,7 @@ impl Compaction {
             self.catalog_name.clone(),
             self.metrics.clone(),
             consistency_params,
+            self.snapshot_properties.clone().unwrap_or_default(),
         )
     }
 }
@@ -796,6 +844,8 @@ pub struct CommitManager {
     metrics_recorder: CompactionMetricsRecorder,
     /// Schema ID for validation
     basic_schema_id: i32,
+    /// Additional snapshot summary properties to inject into every commit.
+    snapshot_properties: HashMap<String, String>,
 }
 
 /// Parameters for commit consistency validation.
@@ -819,6 +869,7 @@ impl CommitManager {
         catalog_name: impl Into<Cow<'static, str>>,
         metrics: Arc<Metrics>,
         consistency_params: CommitConsistencyParams,
+        snapshot_properties: HashMap<String, String>,
     ) -> Self {
         let catalog_name = catalog_name.into();
         let table_ident_name = table_ident_name.into();
@@ -834,6 +885,7 @@ impl CommitManager {
             use_starting_sequence_number: consistency_params.use_starting_sequence_number,
             metrics_recorder,
             basic_schema_id: consistency_params.basic_schema_id,
+            snapshot_properties,
         }
     }
 
@@ -994,7 +1046,9 @@ impl CommitManager {
                             .set_target_branch(to_branch.to_owned())
                             .set_new_data_file_sequence_number(snapshot.sequence_number())
                             .set_check_file_existence(true);
-                        action.set_snapshot_properties(custom_snapshot_properties(snapshot));
+                        let mut props = custom_snapshot_properties(snapshot);
+                        props.extend(self.snapshot_properties.clone());
+                        action.set_snapshot_properties(props);
                         action
                     } else {
                         return Err(iceberg::Error::new(
@@ -1013,7 +1067,9 @@ impl CommitManager {
                         .set_target_branch(to_branch.to_owned())
                         .set_check_file_existence(true);
                     if let Some(snapshot) = table.metadata().snapshot_for_ref(to_branch) {
-                        action.set_snapshot_properties(custom_snapshot_properties(snapshot));
+                        let mut props = custom_snapshot_properties(snapshot);
+                        props.extend(self.snapshot_properties.clone());
+                        action.set_snapshot_properties(props);
                     }
                     action
                 };
@@ -1111,7 +1167,9 @@ impl CommitManager {
                             .set_target_branch(to_branch.to_owned())
                             .set_new_data_file_sequence_number(snapshot.sequence_number())
                             .set_check_file_existence(true);
-                        action.set_snapshot_properties(custom_snapshot_properties(snapshot));
+                        let mut props = custom_snapshot_properties(snapshot);
+                        props.extend(self.snapshot_properties.clone());
+                        action.set_snapshot_properties(props);
                         action
                     } else {
                         return Err(iceberg::Error::new(
@@ -1129,7 +1187,9 @@ impl CommitManager {
                         .set_target_branch(to_branch.to_owned())
                         .set_check_file_existence(true);
                     if let Some(snapshot) = table.metadata().snapshot_for_ref(to_branch) {
-                        action.set_snapshot_properties(custom_snapshot_properties(snapshot));
+                        let mut props = custom_snapshot_properties(snapshot);
+                        props.extend(self.snapshot_properties.clone());
+                        action.set_snapshot_properties(props);
                     }
                     action
                 };
@@ -1287,12 +1347,39 @@ impl CompactionPlan {
 /// Planner for generating compaction plans from table snapshots.
 pub struct CompactionPlanner {
     config: CompactionPlanningConfig,
+    /// Optional predicate pushed into the scan to prune files at plan time.
+    predicate: Option<Predicate>,
+    /// Optional set of partition values to restrict compaction to.
+    partition_filter: Option<Vec<Struct>>,
 }
 
 impl CompactionPlanner {
     /// Creates a new planner with the given configuration.
+    ///
+    /// No selection filter is applied by default; use [`with_predicate`](Self::with_predicate)
+    /// and/or [`with_partition_filter`](Self::with_partition_filter) to scope the run.
     pub fn new(config: CompactionPlanningConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            predicate: None,
+            partition_filter: None,
+        }
+    }
+
+    /// Scopes the run to files matching `predicate`, pushed into the scan so files
+    /// are pruned during planning.
+    #[must_use]
+    pub fn with_predicate(mut self, predicate: Predicate) -> Self {
+        self.predicate = Some(predicate);
+        self
+    }
+
+    /// Scopes the run to files in the given set of partition values. An empty set
+    /// selects no files. Matching assumes a stable partition spec.
+    #[must_use]
+    pub fn with_partition_filter(mut self, partitions: Vec<Struct>) -> Self {
+        self.partition_filter = Some(partitions);
+        self
     }
 
     /// Plans compaction for a specific branch.
@@ -1349,9 +1436,26 @@ impl CompactionPlanner {
         snapshot_id: i64,
     ) -> Result<Vec<FileGroup>> {
         use crate::file_selection::PlanStrategy;
+        use crate::file_selection::strategy::PartitionFilterStrategy;
 
-        let strategy = PlanStrategy::from(&self.config);
-        FileSelector::get_scan_tasks_with_strategy(table, snapshot_id, strategy, &self.config).await
+        let mut strategy = PlanStrategy::from(&self.config);
+
+        // Filter to the target partitions before grouping so it composes with any
+        // file-group scope.
+        if let Some(partitions) = &self.partition_filter {
+            strategy.prepend_file_filter(Box::new(PartitionFilterStrategy::from_structs(
+                partitions.iter().cloned(),
+            )));
+        }
+
+        FileSelector::get_scan_tasks_with_strategy(
+            table,
+            snapshot_id,
+            strategy,
+            &self.config,
+            self.predicate.as_ref(),
+        )
+        .await
     }
 }
 
@@ -1782,6 +1886,27 @@ mod tests {
 
         let result = compaction.compact().await.unwrap().unwrap();
         assert_compaction_stats(&result.stats, initial_file_count, false);
+    }
+
+    #[tokio::test]
+    async fn test_compact_empty_partition_filter_returns_none() {
+        let env = create_test_env().await;
+        let data_files = write_simple_files(&env.table, &env.warehouse_location, "noop", 3).await;
+        let _ = append_and_commit(&env.table, env.catalog.as_ref(), data_files).await;
+
+        let compaction = CompactionBuilder::new(env.catalog.clone(), env.table_ident.clone())
+            .with_config(Arc::new(
+                CompactionConfigBuilder::default()
+                    .execution(CompactionExecutionConfigBuilder::default().build().unwrap())
+                    .build()
+                    .unwrap(),
+            ))
+            .with_partition_filter(vec![])
+            .build();
+
+        // An empty partition filter selects no files, so the managed workflow is a no-op.
+        let result = compaction.compact().await.unwrap();
+        assert!(result.is_none());
     }
 
     #[tokio::test]

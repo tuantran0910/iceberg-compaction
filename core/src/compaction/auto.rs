@@ -139,7 +139,8 @@ impl AutoCompactionPlanner {
 
         let snapshot_id = snapshot.snapshot_id();
 
-        let mut tasks = Some(FileSelector::scan_data_files(table, snapshot_id).await?);
+        // Auto-compaction always scans the full snapshot (no scoped selection).
+        let mut tasks = Some(FileSelector::scan_data_files(table, snapshot_id, None).await?);
         let total_data_bytes = compute_total_data_bytes(tasks.as_ref().unwrap());
         let stats = Self::compute_stats(
             tasks.as_ref().unwrap(),

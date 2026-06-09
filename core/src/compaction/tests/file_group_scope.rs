@@ -67,6 +67,93 @@ fn planner(file_group_scope: FileGroupScope) -> CompactionPlanner {
     ))
 }
 
+// partitioned_data_files lays out 5 files: 2 in partition 0, 1 in partition 1, 2 in partition 2.
+
+#[tokio::test]
+async fn test_plan_compaction_with_partition_filter() {
+    let env = create_partitioned_test_env().await;
+    let updated_table = append_and_commit(
+        &env.table,
+        env.catalog.as_ref(),
+        partitioned_data_files(&env.table),
+    )
+    .await;
+
+    // Restrict to partitions 0 and 2; partition 1 is excluded.
+    let plans = planner(FileGroupScope::Partition)
+        .with_partition_filter(vec![partition_value(0), partition_value(2)])
+        .plan_compaction(&updated_table)
+        .await
+        .unwrap();
+
+    assert_eq!(plans.len(), 2);
+    assert_eq!(plans.iter().map(|p| p.file_count()).sum::<usize>(), 4);
+}
+
+#[tokio::test]
+async fn test_partition_filter_composes_with_table_scope() {
+    let env = create_partitioned_test_env().await;
+    let updated_table = append_and_commit(
+        &env.table,
+        env.catalog.as_ref(),
+        partitioned_data_files(&env.table),
+    )
+    .await;
+
+    // Table scope bin-packs the surviving files (partitions 0 and 2) into one group.
+    let plans = planner(FileGroupScope::Table)
+        .with_partition_filter(vec![partition_value(0), partition_value(2)])
+        .plan_compaction(&updated_table)
+        .await
+        .unwrap();
+
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].file_count(), 4);
+}
+
+#[tokio::test]
+async fn test_empty_partition_filter_is_noop() {
+    let env = create_partitioned_test_env().await;
+    let updated_table = append_and_commit(
+        &env.table,
+        env.catalog.as_ref(),
+        partitioned_data_files(&env.table),
+    )
+    .await;
+
+    let plans = planner(FileGroupScope::Partition)
+        .with_partition_filter(vec![])
+        .plan_compaction(&updated_table)
+        .await
+        .unwrap();
+
+    assert!(plans.is_empty());
+}
+
+#[tokio::test]
+async fn test_predicate_filter_prunes_partitions() {
+    use iceberg::expr::Reference;
+    use iceberg::spec::Datum;
+
+    let env = create_partitioned_test_env().await;
+    let updated_table = append_and_commit(
+        &env.table,
+        env.catalog.as_ref(),
+        partitioned_data_files(&env.table),
+    )
+    .await;
+
+    // `id` is an identity partition column, so the predicate prunes to partition 0 only.
+    let plans = planner(FileGroupScope::Partition)
+        .with_predicate(Reference::new("id").equal_to(Datum::int(0)))
+        .plan_compaction(&updated_table)
+        .await
+        .unwrap();
+
+    assert_eq!(plans.len(), 1);
+    assert_eq!(plans[0].file_count(), 2);
+}
+
 async fn create_partitioned_test_env() -> TestEnv {
     let temp_dir = TempDir::new().unwrap();
     let warehouse_location = temp_dir.path().to_str().unwrap().to_owned();
